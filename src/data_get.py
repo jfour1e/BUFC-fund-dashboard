@@ -59,8 +59,8 @@ def fetch_price_data(companies, client):
                 limit=120
             )
             temp_df = pd.DataFrame([{
-                "date": datetime.utcfromtimestamp(a.timestamp / 1000).date(),
-                stock: a.close
+                "date": pd.to_datetime(a.timestamp, unit="ms"),  
+                stock:  a.close
             } for a in aggs])
 
             temp_df.set_index("date", inplace=True)
@@ -68,6 +68,8 @@ def fetch_price_data(companies, client):
         except Exception as e:
             print(f"Failed to fetch {stock}: {e}")
         time.sleep(15)
+
+    prices_data.index = pd.to_datetime(prices_data.index)
 
     return prices_data
 

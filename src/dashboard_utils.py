@@ -90,57 +90,61 @@ def create_holdings_table(portfolio_df: pd.DataFrame, prices_df: pd.DataFrame) -
     """
     Construct an HTML <table> showing:
       - Ticker
-      - Company
       - % of Portfolio
       - Shares Owned
       - Current Value
       - Cost Basis
+      - Return (e.g. P/L or pct, if you want to show that)
       - Price History (YTD sparkline)
+
     Alternates row background for readability.
     """
-    # 4a) Table Header Row
+    # 1) Header Row (no "Company" column, since portfolio_df doesn’t have it)
     header = html.Tr([
-        html.Th('Ticker',                style={'padding': '8px', 'text-align': 'left'}),
-        html.Th('Company',               style={'padding': '8px', 'text-align': 'left'}),
-        html.Th('% of Portfolio',        style={'padding': '8px', 'text-align': 'right'}),
-        html.Th('Shares Owned',          style={'padding': '8px', 'text-align': 'right'}),
-        html.Th('Current Value',         style={'padding': '8px', 'text-align': 'right'}),
-        html.Th('Cost Basis',            style={'padding': '8px', 'text-align': 'right'}),
-        html.Th('Price History (YTD)',   style={'padding': '8px', 'text-align': 'center'})
+        html.Th('Ticker',             style={'padding': '8px', 'text-align': 'left'}),
+        html.Th('% of Portfolio',     style={'padding': '8px', 'text-align': 'right'}),
+        html.Th('Shares Owned',       style={'padding': '8px', 'text-align': 'right'}),
+        html.Th('Current Value',      style={'padding': '8px', 'text-align': 'right'}),
+        html.Th('Cost Basis',         style={'padding': '8px', 'text-align': 'right'}),
+        html.Th('Return',             style={'padding': '8px', 'text-align': 'right'}),
+        html.Th('Price History (YTD)', style={'padding': '8px', 'text-align': 'center'}),
     ], style={'backgroundColor': '#CCCCCC'})
 
-    # 4b) Determine “start of current year” for YTD filtering
+    # 2) Determine “start of current year” for YTD filtering
     start_of_year = pd.Timestamp(datetime.today().year, 1, 1)
 
-    # 4c) Build each row
+    # 3) Build each row
     rows = []
     for idx, row in portfolio_df.iterrows():
         ticker     = row['Ticker']
-        company    = row['Company']
         weight_pct = row['weights']
         shares     = row['shares']
         curr_val   = row['current value']
-        cost       = row['cost basis']
+        cost_basis = row['cost basis']
+        ret_val    = row.get('return', None)  # Use .get in case "return" is missing
 
-        # Extract YTD price series for sparkline
+        # 3a) Extract YTD price series for sparkline
         if ticker in prices_df.columns:
             prices_series = prices_df[ticker][prices_df.index >= start_of_year]
         else:
             prices_series = pd.Series(dtype=float)
 
+        # Create the sparkline figure (you must have defined create_sparkline elsewhere)
         sparkline_fig = create_sparkline(prices_series)
 
-        # Alternate row color
-        bg_color = '#F9F9F9' if idx % 2 == 0 else 'white'
+        # 3b) Alternate row color shading
+        bg_color = '#F9F9F9' if (idx % 2 == 0) else 'white'
 
+        # 3c) Create the <tr> for this row
         rows.append(
             html.Tr([
-                html.Td(ticker, style={'padding': '8px'}),
-                html.Td(company, style={'padding': '8px'}),
-                html.Td(f"{weight_pct:.2%}", style={'padding': '8px', 'text-align': 'right'}),
-                html.Td(f"{shares:,}", style={'padding': '8px', 'text-align': 'right'}),
-                html.Td(f"${curr_val:,.2f}", style={'padding': '8px', 'text-align': 'right'}),
-                html.Td(f"${cost:,.2f}", style={'padding': '8px', 'text-align': 'right'}),
+                html.Td(ticker,                                    style={'padding': '8px'}),
+                html.Td(f"{weight_pct:.2%}",                       style={'padding': '8px', 'text-align': 'right'}),
+                html.Td(f"{shares:,}",                             style={'padding': '8px', 'text-align': 'right'}),
+                html.Td(f"${curr_val:,.2f}",                       style={'padding': '8px', 'text-align': 'right'}),
+                html.Td(f"${cost_basis:,.2f}",                     style={'padding': '8px', 'text-align': 'right'}),
+                html.Td(f"{ret_val:.2%}" if ret_val is not None else "—",
+                        style={'padding': '8px', 'text-align': 'right'}),
                 html.Td(
                     dcc.Graph(figure=sparkline_fig, config={'displayModeBar': False}),
                     style={'padding': '2px', 'width': '120px'}
@@ -148,6 +152,7 @@ def create_holdings_table(portfolio_df: pd.DataFrame, prices_df: pd.DataFrame) -
             ], style={'backgroundColor': bg_color})
         )
 
+    # 4) Assemble the entire <table>
     table = html.Table(
         [header] + rows,
         style={'width': '100%', 'border-collapse': 'collapse'}

@@ -40,6 +40,7 @@ live_portfolio = build_live_portfolio(holdings, prices_data)
 live_portfolio['current value'] = live_portfolio['Ticker'].map(current_prices) * live_portfolio['shares']
 live_portfolio['weights'] = live_portfolio['current value'] / live_portfolio['current value'].sum()
 
+print("___________ Fetched Data ___________")
 
 #create dash app 
 app = dash.Dash(__name__)
@@ -123,4 +124,4 @@ app.layout = html.Div([
 ])
 
 if __name__ == '__main__':
-    app.run_server(debug=True)
+    app.run(host='127.0.0.1', port=8050, debug=True)
