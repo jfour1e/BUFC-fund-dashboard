@@ -69,20 +69,20 @@ def random_z_score():
 
 days = 5 # change based on days
 
-def scenerio_gain_loss(port_value, port_standarddev, randz_score, days):
-    return port_val * port_return * days + port_val * port_std * z_score * np.sqrt(days)
+def scenario_gain_loss(port_value, port_standarddev, randz_score, days):
+    return port_value * port_return * days + port_value * port_standarddev * randz_score * np.sqrt(days)
 
 simulations = 10000
-scenerioReturn = []
+scenarioReturn = []
 
 for i in range(simulations):
     z_score = random_z_score()
-    scenerioReturn.append(scenerio_gain_loss(port_val, port_std, z_score, days))
+    scenarioReturn.append(scenario_gain_loss(port_val, port_std, z_score, days))
 
 confidence_interval = 0.95
-VaR = -np.percentile(scenerioReturn, 100 * (1 - confidence_interval))
+VaR = -np.percentile(scenarioReturn, 100 * (1 - confidence_interval))
 
-plt.hist(scenerioReturn, bins=50, density=True, edgecolor='black')
+plt.hist(scenarioReturn, bins=50, density=True, edgecolor='black')
 plt.xlabel('Scenario Gain/Loss ($)')
 plt.ylabel('Frequency')
 plt.title(f'Distribution of Portfolio Gain/Loss Over {days} Days')
