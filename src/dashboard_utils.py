@@ -4,6 +4,7 @@ import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
 from datetime import datetime
+import math
 
 def compute_daily_pct_change(prices_df):
     """
@@ -78,10 +79,10 @@ def create_sparkline(prices_series: pd.Series) -> go.Figure:
         )
     ])
     fig.update_layout(
+        height=20, 
         xaxis    = dict(visible=False),
         yaxis    = dict(visible=False),
         margin   = dict(l=0, r=0, t=2, b=2),
-        height   = 40
     )
     return fig
 
@@ -123,6 +124,8 @@ def create_holdings_table(portfolio_df: pd.DataFrame, prices_df: pd.DataFrame) -
         cost_basis = row['cost basis']
         ret_val    = row.get('return', None)  # Use .get in case "return" is missing
 
+        shares_display = math.ceil(shares - 1e-6) 
+
         # 3a) Extract YTD price series for sparkline
         if ticker in prices_df.columns:
             prices_series = prices_df[ticker][prices_df.index >= start_of_year]
@@ -140,7 +143,8 @@ def create_holdings_table(portfolio_df: pd.DataFrame, prices_df: pd.DataFrame) -
             html.Tr([
                 html.Td(ticker,                                    style={'padding': '8px'}),
                 html.Td(f"{weight_pct:.2%}",                       style={'padding': '8px', 'text-align': 'right'}),
-                html.Td(f"{shares:,}",                             style={'padding': '8px', 'text-align': 'right'}),
+                html.Td(f"{shares_display:,.2f}",         
+                    style={'padding': '8px', 'text-align': 'right'}), 
                 html.Td(f"${curr_val:,.2f}",                       style={'padding': '8px', 'text-align': 'right'}),
                 html.Td(f"${cost_basis:,.2f}",                     style={'padding': '8px', 'text-align': 'right'}),
                 html.Td(f"{ret_val:.2%}" if ret_val is not None else "—",
@@ -164,7 +168,7 @@ def compute_cumulative_returns(
     portfolio_df: pd.DataFrame,
     prices_df: pd.DataFrame,
     benchmark_series: pd.Series
-) -> (pd.Series, pd.Series):
+):
     """
     Compute two time series:
       (a) portfolio_cum: the portfolio’s cumulative return over time
