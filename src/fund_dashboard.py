@@ -6,6 +6,8 @@ import dash
 import os
 from dash import dcc, html
 import plotly.graph_objects as go
+import plotly.io as pio
+pio.templates.default = "plotly_white"
 
 from polygon import RESTClient
 from dateutil.relativedelta import relativedelta
