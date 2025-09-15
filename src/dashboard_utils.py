@@ -306,3 +306,156 @@ def create_sector_donut(df: pd.DataFrame) -> go.Figure:
         ]
     )
     return fig
+
+import numpy as np
+import yfinance as yf
+import plotly.graph_objs as go
+import numpy as np
+import plotly.graph_objects as go
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+
+def compute_var_time_series(live_portfolio, prices_data, days=5, confidence=0.95, window=30):
+    """
+    Compute rolling Value at Risk (VaR) for the portfolio over the past `window` days.
+
+    Parameters:
+        live_portfolio (pd.DataFrame): Portfolio with tickers, weights, and current value
+        prices_data (pd.DataFrame): Historical adjusted prices of tickers
+        days (int): Horizon in days (default = 5)
+        confidence (float): Confidence level (default = 0.95)
+        window (int): Number of days back to compute daily VaR values (default = 180)
+
+    Returns:
+        var_series (pd.Series): Dollar VaR time series
+        fig (go.Figure): Plotly line chart
+    """
+
+    # Compute daily log returns
+    log_returns = np.log(prices_data / prices_data.shift(1)).dropna()
+
+    # Align weights with tickers present in prices_data
+    weights = live_portfolio.set_index("Ticker").loc[log_returns.columns, "weights"].values
+
+    # Compute portfolio returns
+    portfolio_returns = log_returns.dot(weights)
+
+    # Portfolio value today
+    portfolio_value = live_portfolio["current value"].sum()
+
+    # Rolling historical VaR calculation
+    var_values = []
+    dates = []
+
+    for i in range(window, len(portfolio_returns)):
+        window_returns = portfolio_returns.iloc[i - window:i]  # rolling window
+        var_1d = np.percentile(window_returns, (1 - confidence) * 100)
+        var_days = var_1d * np.sqrt(days)
+        var_dollar = var_days * portfolio_value
+
+        var_values.append(var_dollar)
+        dates.append(portfolio_returns.index[i])
+
+    var_series = pd.Series(var_values, index=dates)
+
+    # Plotly line chart
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=var_series.index,
+        y=var_series.values,
+        mode="lines",
+        line=dict(color="red"),
+        name=f"{days}-Day {int(confidence*100)}% VaR"
+    ))
+    fig.update_layout(
+        title=f"Rolling {days}-Day Portfolio VaR (Historical Simulation, {int(confidence*100)}% Confidence)",
+        xaxis_title="Date",
+        yaxis=dict(title="VaR ($)", tickformat=",.0f")
+    )
+
+    return var_series, fig
+
+def create_var_histogram(var_series: pd.Series, bins: int = 25, confidence: float = 0.95, days: int = 5):
+    """
+    Create a histogram of historical VaR values.
+    Returns a Plotly figure. If var_series is empty, returns an empty figure with a message.
+    """
+    import plotly.express as px
+    import plotly.graph_objects as go
+
+    if var_series is None or var_series.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            x=0.5, y=0.5, text="Not enough data to compute VaR",
+            showarrow=False, xref="paper", yref="paper", font=dict(size=16)
+        )
+        fig.update_layout(
+            title="Distribution of VaR - insufficient data",
+            xaxis=dict(title="VaR ($)"),
+            yaxis=dict(title="Frequency")
+        )
+        return fig
+
+    fig = px.histogram(
+        var_series,
+        nbins=bins,
+        title=f"Distribution of {days}-Day VaR (Historical Simulation, {int(confidence*100)}% Confidence)",
+        labels={'value': 'VaR ($)'}
+    )
+    fig.update_traces(marker_color="red", opacity=0.7)
+    fig.update_layout(
+        xaxis=dict(title="VaR ($)", tickformat=",.0f"),
+        yaxis=dict(title="Frequency"),
+        bargap=0.05
+    )
+    return fig
+
+def create_monte_carlo_var_hist_5d(live_portfolio, prices_data, sims=10000, days=5, confidence=0.95):
+    
+    tickers = [t for t in live_portfolio['Ticker'] if t in prices_data.columns]
+    if not tickers:
+        fig = go.Figure()
+        fig.add_annotation(
+            x=0.5, y=0.5, text="No valid tickers in price data for Monte Carlo VaR",
+            showarrow=False, xref="paper", yref="paper", font=dict(size=16)
+        )
+        fig.update_layout(
+            title="Monte Carlo 5-Day VaR - No Data",
+            xaxis=dict(title="Simulated Cumulative Return"),
+            yaxis=dict(title="Frequency")
+        )
+        return fig
+
+    # Corresponding weights
+    weights = live_portfolio.set_index('Ticker').loc[tickers, 'weights']
+
+    port_returns = prices_data[tickers].pct_change().dropna().dot(weights)
+
+    recent_returns = port_returns.tail(5)
+    mu = recent_returns.mean()
+    sigma = recent_returns.std()
+
+    sim_returns = np.random.normal(mu, sigma, sims*days).reshape(sims, days)
+    sim_cum_returns = (1 + sim_returns).prod(axis=1) - 1
+
+    # VaR cutoff
+    var_level = np.percentile(sim_cum_returns, (1 - confidence) * 100)
+
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(x=sim_cum_returns, nbinsx=50, name="Simulated 5-Day Returns"))
+    fig.add_vline(x=var_level, line_dash="dash", line_color="red",
+                  annotation_text=f"VaR @ {confidence*100:.0f}% = {var_level:.2%}",
+                  annotation_position="top right")
+    fig.update_layout(
+        title=f"Monte Carlo {days}-Day VaR (past 5 days)",
+        xaxis_title="Simulated Cumulative Return",
+        yaxis_title="Frequency"
+    )
+
+    missing = set(live_portfolio['Ticker']) - set(tickers)
+    if missing:
+        print(f"Warning: These tickers were skipped in Monte Carlo VaR (no price data): {missing}")
+
+    return fig
