@@ -1,0 +1,9 @@
+dash
+pandas
+numpy
+plotly
+flask
+gunicorn
+python-dateutil
+polygon-api-client
+openpyxl
