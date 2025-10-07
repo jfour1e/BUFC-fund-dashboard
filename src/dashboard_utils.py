@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import math
+import yfinance as yf
 
 def compute_daily_pct_change(prices_df):
     """
@@ -121,7 +122,7 @@ def create_treemap(portfolio_df) -> go.Figure:
             line=dict(width=0.2, color="#f0f0f0")
         ),
         texttemplate = "<b>%{label}</b>",
-        textfont     = dict(color="white", size=14),
+        textfont = dict(color="white", size=16),
         textposition = "middle center",
         customdata   = [None] + changes_leaf,
         hovertemplate= hovertemplates,
@@ -192,7 +193,7 @@ def create_holdings_table(portfolio_df: pd.DataFrame, prices_df: pd.DataFrame) -
         html.Th('Shares Owned',            style={'padding': '8px', 'text-align': 'right'}),
         html.Th('Current Value',           style={'padding': '8px', 'text-align': 'right'}),
         html.Th('Cost Basis',              style={'padding': '8px', 'text-align': 'right'}),
-        html.Th('Return',                  style={'padding': '8px', 'text-align': 'right'}),
+        html.Th('Return',                  style={'padding': '8px', 'text-align': 'center'}),
         html.Th('Price History (YTD)',      style={'padding': '8px', 'text-align': 'center'}),
     ], style={'backgroundColor': '#CCCCCC'})
         
@@ -233,7 +234,7 @@ def create_holdings_table(portfolio_df: pd.DataFrame, prices_df: pd.DataFrame) -
                 html.Td(f"${curr_val:,.2f}",                       style={'padding': '8px', 'text-align': 'right'}),
                 html.Td(f"${cost_basis:,.2f}",                     style={'padding': '8px', 'text-align': 'right'}),
                 html.Td(f"{ret_val:.2%}" if ret_val is not None else "—",
-                        style={'padding': '8px', 'text-align': 'right'}),
+                        style={'padding': '8px', 'text-align': 'center'}),
                 html.Td(
                     dcc.Graph(figure=sparkline_fig, config={'displayModeBar': False, 'staticPlot': True, 'responsive': False}),
                     style={'padding': '2px', 'width': '120px', 'height': '24px'}
@@ -254,19 +255,7 @@ def compute_cumulative_returns(
     prices_df: pd.DataFrame,
     benchmark_series: pd.Series
 ):
-    """
-    Compute two time series:
-      (a) portfolio_cum: the portfolio’s cumulative return over time
-      (b) benchmark_cum: the benchmark’s cumulative return over time (e.g. Russell 2000)
-    Steps:
-      1. Multiply each ticker’s daily price by number of shares → daily position values
-      2. Sum across tickers → daily portfolio total value
-      3. Compute daily % returns, then take (1 + returns).cumprod()
-      4. Do the same for benchmark_series
-    Returns:
-      portfolio_cum, benchmark_cum  (both pandas.Series indexed by date)
-    """
-    # (1) Build a “shares” series aligned to prices_df’s columns
+    
     shares_series = portfolio_df.set_index('Ticker')['shares']
     # Filter for tickers actually present in prices_df
     common_tickers = [t for t in shares_series.index if t in prices_df.columns]
@@ -307,31 +296,7 @@ def create_sector_donut(df: pd.DataFrame) -> go.Figure:
     )
     return fig
 
-import numpy as np
-import yfinance as yf
-import plotly.graph_objs as go
-import numpy as np
-import plotly.graph_objects as go
-
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-
 def compute_var_time_series(live_portfolio, prices_data, days=5, confidence=0.95, window=30):
-    """
-    Compute rolling Value at Risk (VaR) for the portfolio over the past `window` days.
-
-    Parameters:
-        live_portfolio (pd.DataFrame): Portfolio with tickers, weights, and current value
-        prices_data (pd.DataFrame): Historical adjusted prices of tickers
-        days (int): Horizon in days (default = 5)
-        confidence (float): Confidence level (default = 0.95)
-        window (int): Number of days back to compute daily VaR values (default = 180)
-
-    Returns:
-        var_series (pd.Series): Dollar VaR time series
-        fig (go.Figure): Plotly line chart
-    """
 
     # Compute daily log returns
     log_returns = np.log(prices_data / prices_data.shift(1)).dropna()
@@ -350,7 +315,7 @@ def compute_var_time_series(live_portfolio, prices_data, days=5, confidence=0.95
     dates = []
 
     for i in range(window, len(portfolio_returns)):
-        window_returns = portfolio_returns.iloc[i - window:i]  # rolling window
+        window_returns = portfolio_returns.iloc[i - window:i] 
         var_1d = np.percentile(window_returns, (1 - confidence) * 100)
         var_days = var_1d * np.sqrt(days)
         var_dollar = var_days * portfolio_value
@@ -359,8 +324,6 @@ def compute_var_time_series(live_portfolio, prices_data, days=5, confidence=0.95
         dates.append(portfolio_returns.index[i])
 
     var_series = pd.Series(var_values, index=dates)
-
-    # Plotly line chart
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=var_series.index,
@@ -378,10 +341,6 @@ def compute_var_time_series(live_portfolio, prices_data, days=5, confidence=0.95
     return var_series, fig
 
 def create_var_histogram(var_series: pd.Series, bins: int = 25, confidence: float = 0.95, days: int = 5):
-    """
-    Create a histogram of historical VaR values.
-    Returns a Plotly figure. If var_series is empty, returns an empty figure with a message.
-    """
     import plotly.express as px
     import plotly.graph_objects as go
 
@@ -428,11 +387,8 @@ def create_monte_carlo_var_hist_5d(live_portfolio, prices_data, sims=10000, days
         )
         return fig
 
-    # Corresponding weights
     weights = live_portfolio.set_index('Ticker').loc[tickers, 'weights']
-
     port_returns = prices_data[tickers].pct_change().dropna().dot(weights)
-
     recent_returns = port_returns.tail(5)
     mu = recent_returns.mean()
     sigma = recent_returns.std()
@@ -442,7 +398,6 @@ def create_monte_carlo_var_hist_5d(live_portfolio, prices_data, sims=10000, days
 
     # VaR cutoff
     var_level = np.percentile(sim_cum_returns, (1 - confidence) * 100)
-
     fig = go.Figure()
     fig.add_trace(go.Histogram(x=sim_cum_returns, nbinsx=50, name="Simulated 5-Day Returns"))
     fig.add_vline(x=var_level, line_dash="dash", line_color="red",
