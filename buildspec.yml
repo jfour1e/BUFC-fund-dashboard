@@ -1,0 +1,21 @@
+version: 0.2
+
+env:
+  variables:
+    CSV_BUCKET: "csvfilesbufc"
+    AWS_DEFAULT_REGION: "us-east-1"
+
+phases:
+  install:
+    commands:
+      - echo "Installing AWS CLI"
+      - pip install awscli --upgrade
+
+  build:
+    commands:
+      - echo "Uploading CSVs to s3://$CSV_BUCKET/"
+      - for f in $(find . -name '*.csv'); do aws s3 cp "$f" "s3://$CSV_BUCKET/$f"; done
+
+artifacts:
+  files:
+    - '**/*'
