@@ -21,12 +21,12 @@ from src.portfolio_optimizer import (
     OptimizationConfig
 )
 from src.companies import companies, sector_designations
+from API_KEY import POLYGON_API_KEY
 import pandas as pd
 import numpy as np
 from polygon import RESTClient
 
 # File-wide API key (set this to your Polygon API key)
-POLYGON_API_KEY = "apRxKKpQoM2_K8sPhJ5a0IFvs7C0tGs1" 
 
 def main():
     """

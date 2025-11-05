@@ -24,7 +24,7 @@ from dashboard_utils import (
     create_holdings_table, compute_cumulative_returns, 
     create_sector_donut
 )
-
+from API_KEY import POLYGON_API_KEY
 
 """
 Fetch Data 
@@ -35,8 +35,7 @@ filepath = os.path.join(BASE_DIR, "BUFC_May_2025_Allocations.xlsx")
 holdings = load_clean_holdings(filepath)
 sector_allocations = load_clean_sector_allocations(filepath)
 
-API_KEY = "apRxKKpQoM2_K8sPhJ5a0IFvs7C0tGs1" 
-client = RESTClient(API_KEY)
+client = RESTClient(POLYGON_API_KEY)
 
 prices_data = fetch_price_data(companies, client)
 rut_series = fetch_RUT_data(client)
