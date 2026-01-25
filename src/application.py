@@ -21,13 +21,13 @@ application = app.server
 from polygon import RESTClient
 from dateutil.relativedelta import relativedelta
 
-from companies import companies, sector_designations
-from data_get import (
+from src.companies import companies, sector_designations
+from src.data_get import (
     load_clean_holdings, load_clean_sector_allocations,
     fetch_price_data, build_live_portfolio, 
     fetch_RUT_data
 )
-from dashboard_utils import (
+from src.dashboard_utils import (
     compute_daily_pct_change, assign_color, 
     create_treemap, create_sparkline, 
     create_holdings_table, compute_cumulative_returns, 
