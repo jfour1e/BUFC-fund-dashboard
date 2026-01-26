@@ -5,44 +5,30 @@ from pathlib import Path
 from polygon import RESTClient
 from datetime import datetime, timezone
 from typing import Iterable, Optional, Tuple
-import boto3
-from io import StringIO
 
-s3 = boto3.client("s3")
-bucket = "csvfilesbufc"
+ROOT_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_PRICE_CSV = ROOT_DIR / "daily_prices.csv"
+DEFAULT_RUT_CSV   = ROOT_DIR / "rut_daily.csv"
 
-# Read CSV
-# price_obj = s3.get_object(Bucket=bucket, Key="daily_prices.csv")
-# rut_obj = s3.get_object(Bucket=bucket, Key="rut_daily.csv")
-# DEFAULT_PRICE_CSV = pd.read_csv(price_obj["Body"])
-# DEFAULT_RUT_CSV = pd.read_csv(rut_obj["Body"])
-DEFAULT_PRICE_CSV_PATH = "daily_prices.csv"
-DEFAULT_RUT_CSV_PATH = "rut_daily.csv"
+def _resolve_to_root(path_like) -> Path:
+    """Return an absolute Path. Relative paths are resolved against project root."""
+    p = Path(path_like)
+    return p if p.is_absolute() else (ROOT_DIR / p)
 
-def _read_cached_wide_s3(key: str) -> pd.DataFrame:
-    """Read a CSV from S3 into a DataFrame, set date index, sort by date."""
-    try:
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        df = pd.read_csv(obj['Body'], parse_dates=['date'])
-        df.set_index('date', inplace=True)
+def _read_cached_wide(path: Path) -> pd.DataFrame:
+    if path.exists():
+        df = pd.read_csv(path, parse_dates=["date"])
+        df.set_index("date", inplace=True)
         df.index = pd.to_datetime(df.index)
         return df.sort_index()
-    except s3.exceptions.NoSuchKey:
-        # File not in S3 yet
-        return pd.DataFrame()
-    except Exception as e:
-        print(f"Failed to read {key} from S3: {e}")
-        return pd.DataFrame()
+    return pd.DataFrame()
 
-def _write_cached_s3(df: pd.DataFrame, key: str) -> None:
-    """Write DataFrame to S3 as CSV, sorted by date."""
-    if df.empty:
-        return
-    df_to_save = df.sort_index()
-    df_to_save.index.name = 'date'
-    csv_buffer = StringIO()
-    df_to_save.to_csv(csv_buffer, date_format="%Y-%m-%d")
-    s3.put_object(Bucket=bucket, Key=key, Body=csv_buffer.getvalue())
+def _write_cached(df: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    
+    out = df.sort_index()
+    out.index.name = "date"
+    df.sort_index().to_csv(path, date_format="%Y-%m-%d")
 
 def _sleep_with_jitter(base: float, jitter: float = 0.4):
     time.sleep(base + random.random() * jitter)
@@ -90,7 +76,7 @@ def load_clean_sector_allocations(filepath: str, sheet_name=1):
 def fetch_price_data(
     companies, 
     client, 
-    s3_key: str = "daily_prices.csv",  # S3 key
+    csv_path: str | Path = DEFAULT_PRICE_CSV,
     start_date: str | datetime = "2025-01-01",
     end_date: datetime | None = None,
     request_limit_per_min: int = 4,   
@@ -98,12 +84,22 @@ def fetch_price_data(
     polygon_limit: int = 365,
 ) -> pd.DataFrame:
     
-    # Load cached prices from S3
-    prices = _read_cached_wide_s3(s3_key)
+    """
+    Fetch daily close prices for `companies` from Polygon, with CSV caching and incremental updates.
+
+    Behavior:
+      - Loads existing CSV if present.
+      - For each ticker, only requests missing dates (latest_date+1 → today).
+      - Respects a simple per-minute rate limit and a small delay between calls.
+      - Returns a wide DataFrame indexed by date; columns are tickers.
+    """
+    
+    csv_path = _resolve_to_root(csv_path)
+    prices = _read_cached_wide(csv_path)
 
     start_dt = pd.to_datetime(start_date)
     end_dt = end_date or datetime.today()
-    end_str = end_dt.strftime("%Y-%m-%d")
+    end_str = pd.to_datetime(end_dt).strftime("%Y-%m-%d")
 
     request_count = 0
     window_start = time.time()
@@ -118,12 +114,18 @@ def fetch_price_data(
             request_count = 0
 
     for ticker in companies:
-        if ticker in prices.columns and not prices[ticker].dropna().empty:
-            latest = prices[ticker].dropna().index.max()
-            if latest >= end_dt - pd.Timedelta(days=1):
-                print(f"{ticker}: up-to-date.")
-                continue
-            fetch_from_dt = latest + pd.Timedelta(days=1)
+        # incremental start date for this ticker
+        if ticker in prices.columns:
+            existing = prices[ticker].dropna()
+            if not existing.empty:
+                latest = existing.index.max()
+                # consider 1-day lag to avoid partial/intraday issues
+                if pd.to_datetime(latest) >= pd.to_datetime(end_str) - pd.Timedelta(days=1):
+                    print(f"{ticker}: up-to-date.")
+                    continue
+                fetch_from_dt = latest + pd.Timedelta(days=1)
+            else:
+                fetch_from_dt = start_dt
         else:
             fetch_from_dt = start_dt
 
@@ -131,6 +133,7 @@ def fetch_price_data(
             print(f"{ticker}: no new data needed.")
             continue
 
+        fetch_from_str = fetch_from_dt.strftime("%Y-%m-%d")
         _minute_guard()
 
         try:
@@ -139,7 +142,7 @@ def fetch_price_data(
                 ticker=ticker,
                 multiplier=1,
                 timespan="day",
-                from_=fetch_from_dt.strftime("%Y-%m-%d"),
+                from_=fetch_from_str,
                 to=end_str,
                 adjusted=True,
                 sort="asc",
@@ -157,10 +160,11 @@ def fetch_price_data(
             temp.set_index("date", inplace=True)
             temp.index = pd.to_datetime(temp.index)
 
-            # merge new data
+            # overlap-safe update
             if prices.empty:
                 prices = temp
             elif ticker in prices.columns:
+                # ensure the DF has rows for all new dates
                 prices = prices.reindex(prices.index.union(temp.index))
                 prices[ticker] = prices[ticker].combine_first(temp[ticker])
             else:
@@ -170,32 +174,51 @@ def fetch_price_data(
             request_count += 1
 
             _sleep_with_jitter(pause_between, jitter=0.5)
+            _write_cached(prices, csv_path)  # persist incrementally
 
         except Exception as e:
             print(f"{ticker}: failed with error {e}")
 
-    # Write final updated CSV to S3
-    _write_cached_s3(prices, s3_key)
+    _write_cached(prices, csv_path)
     return prices
 
 
 def fetch_RUT_data(
     client,
-    s3_key: str = "rut_daily.csv",
+    csv_path: str | Path = DEFAULT_RUT_CSV,
     start_date: str | datetime = "2025-01-01",
     end_date: datetime | None = None,
-    polygon_limit: int = 5000,
+    polygon_limit: int = 5000,  # allow long spans
 ) -> pd.Series:
-    
-    rut_df = _read_cached_wide_s3(s3_key)  # Load cache from S3
+    """
+    Returns a Series named 'price' for IWM (Russell 2000 ETF proxy) with a root-level CSV cache.
+      - loads cache if present
+      - fetches missing dates
+      - writes back after updates
+    """
+    csv_path = _resolve_to_root(csv_path)
+
+    # Load cache as df (index=date, col='price')
+    if Path(csv_path).exists():
+        cached = pd.read_csv(csv_path, parse_dates=["date"]).set_index("date").sort_index()
+        cached.index = pd.to_datetime(cached.index)
+        if "price" not in cached.columns:  # backward compatibility with 'IWM'
+            # handle a previous cache with 'IWM' col
+            if "IWM" in cached.columns:
+                cached = cached.rename(columns={"IWM": "price"})
+        rut_df = cached[["price"]]
+    else:
+        rut_df = pd.DataFrame(columns=["price"])
 
     start_dt = pd.to_datetime(start_date)
     end_dt = end_date or datetime.today()
-    end_str = end_dt.strftime("%Y-%m-%d")
+    end_str = pd.to_datetime(end_dt).strftime("%Y-%m-%d")
 
-    if not rut_df.empty and "price" in rut_df.columns and not rut_df["price"].dropna().empty:
+    # Determine incremental start
+    if not rut_df.empty and not rut_df["price"].dropna().empty:
         latest = rut_df.index.max()
-        if latest >= end_dt - pd.Timedelta(days=1):
+        if pd.to_datetime(latest) >= pd.to_datetime(end_str) - pd.Timedelta(days=1):
+            # up-to-date: return as Series
             return rut_df["price"].sort_index()
         fetch_from_dt = latest + pd.Timedelta(days=1)
     else:
@@ -213,7 +236,6 @@ def fetch_RUT_data(
             sort="asc",
             limit=polygon_limit,
         )
-
         temp = pd.DataFrame(
             [{"date": pd.to_datetime(a.timestamp, unit="ms"), "price": a.close} for a in aggs]
         )
@@ -224,9 +246,17 @@ def fetch_RUT_data(
             if rut_df.empty:
                 rut_df = temp
             else:
-                rut_df = rut_df.combine_first(temp)
+                # combine_first on the 'price' column
+                combined = rut_df.copy()
+                for idx, val in temp["price"].items():
+                    if idx not in combined.index or pd.isna(combined.at[idx, "price"]):
+                        combined.loc[idx, "price"] = val
+                rut_df = combined.sort_index()
 
-    _write_cached_s3(rut_df, s3_key)
+            # persist cache (index->date)
+            out = rut_df.sort_index().rename_axis("date").reset_index()
+            out.to_csv(csv_path, index=False, date_format="%Y-%m-%d")
+
     return rut_df["price"].sort_index()
 
 
