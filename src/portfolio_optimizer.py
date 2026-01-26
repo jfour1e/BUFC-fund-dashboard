@@ -167,6 +167,8 @@ def optimize_quadratic_portfolio(
     bands: OptimizerBands,
     benchmark_ticker: str = "IWM",
     lookback_days: int = 252,
+    debug: bool = False,
+    mosek_log: bool = False,
 ) -> dict[str, Any] | None:
     """
     Solve:
@@ -178,15 +180,12 @@ def optimize_quadratic_portfolio(
         ETF/Stock sleeve bands
         TE constraint: sqrt((w-wb)^T Sigma (w-wb)) <= te_cap
 
-    Notes:
-      - We do NOT force hard sector bands.
-      - We ONLY penalize sector deviations for sectors representable by ETF proxies.
-      - Russell weights are renormalized over representable sectors.
-      - benchmark_ticker is not used inside the solve (TE is vs ETF-mapped benchmark),
-        but you can keep it for compatibility / future extension.
+    Debug mode runs staged feasibility checks to pinpoint infeasibility.
     """
-    if mf is None:
-        raise RuntimeError("MOSEK Fusion not available. Install/enable MOSEK Python package.")
+
+    def _dbg(msg: str) -> None:
+        if debug:
+            print(f"[OPT-DBG] {msg}")
 
     # Universe = HOLDINGS_INFO only
     tickers = sorted(holdings_info.keys())
@@ -196,25 +195,35 @@ def optimize_quadratic_portfolio(
 
     # Load prices and build returns (use last lookback_days of trading rows)
     prices = _read_wide_csv(daily_prices_csv)
+
     missing_cols = [t for t in tickers if t not in prices.columns]
     if missing_cols:
         raise ValueError(f"Missing price columns for universe tickers: {missing_cols}")
 
     px = prices[tickers].ffill()
     rets = px.pct_change().dropna()
+
     if len(rets) < max(60, min(lookback_days, 252)):
         raise ValueError(f"Not enough return history ({len(rets)} rows).")
 
     rets = rets.iloc[-lookback_days:] if len(rets) > lookback_days else rets
+
     if rets.isna().any().any():
-        # Should not happen after your checks, but be strict.
         raise ValueError("NaNs present in returns. Fix price history.")
 
     # Covariance (annualized)
     Sigma = LedoitWolf().fit(rets.to_numpy(dtype=float)).covariance_ * 252.0
+    Sigma = 0.5 * (Sigma + Sigma.T)  # symmetrize
+
+    # Basic Sigma diagnostics
+    if debug:
+        evals = np.linalg.eigvalsh(Sigma)
+        _dbg(f"Sigma shape={Sigma.shape}, eig_min={evals.min():.3e}, eig_max={evals.max():.3e}, finite={np.isfinite(Sigma).all()}")
 
     # Alpha (objective linear term)
     alpha = compute_alpha_vector(tickers=tickers, holdings_info=holdings_info)
+    if debug:
+        _dbg(f"Alpha min={alpha.min():.6f}, max={alpha.max():.6f}, finite={np.isfinite(alpha).all()}")
 
     # Benchmark weights (asset space), and sector penalty target b_sec
     w_b, sectors_used, b_sec = _build_benchmark_weights(
@@ -222,6 +231,9 @@ def optimize_quadratic_portfolio(
         holdings_info=holdings_info,
         russell_sector_weights=russell_sector_weights,
     )
+    if debug:
+        _dbg(f"w_b sum={w_b.sum():.6f}, min={w_b.min():.6f}, max={w_b.max():.6f}, len={len(w_b)}")
+        _dbg(f"Representable sectors used={len(sectors_used)}; missing Russell sectors ignored automatically.")
 
     # Sector exposure matrix
     S = _build_sector_exposure_matrix(
@@ -243,73 +255,140 @@ def optimize_quadratic_portfolio(
         else:
             ub[i] = float(bands.max_weight_stock)
 
-    # --- MOSEK model ---
-    M = mf.Model("opt_quadratic_portfolio")
-    w = M.variable("w", n, mf.Domain.inRange(0.0, ub.tolist()))
+    if debug:
+        _dbg(f"Universe n={n}, ETFs={int(is_etf.sum())}, Stocks={int(is_stock.sum())}")
+        _dbg(f"UB sum={ub.sum():.6f}, UB min={ub.min():.6f}, UB max={ub.max():.6f}")
+        _dbg(f"ETF UB sum={ub[is_etf.astype(bool)].sum():.6f}, Stock UB sum={ub[is_stock.astype(bool)].sum():.6f}")
+        _dbg(f"Sleeves: etf_min={bands.etf_min}, etf_max={bands.etf_max}, stock_min={bands.stock_min}, stock_max={bands.stock_max}")
 
-    # Budget
-    M.constraint("budget", mf.Expr.sum(w), mf.Domain.equalsTo(1.0))
+        # quick feasibility sanity checks
+        if ub.sum() < 1.0 - 1e-9:
+            _dbg("❌ infeasible: ub.sum() < 1.0")
+            return None
+        if is_etf.sum() > 0:
+            if ub[is_etf.astype(bool)].sum() + 1e-12 < bands.etf_min:
+                _dbg("❌ infeasible: ETF ub-sum < etf_min")
+                return None
+        if is_stock.sum() > 0:
+            if ub[is_stock.astype(bool)].sum() + 1e-12 < bands.stock_min:
+                _dbg("❌ infeasible: Stock ub-sum < stock_min")
+                return None
 
-    # ETF / stock sleeve bands
-    if is_etf.sum() > 0:
-        M.constraint("etf_min", mf.Expr.dot(is_etf.tolist(), w), mf.Domain.greaterThan(bands.etf_min))
-        M.constraint("etf_max", mf.Expr.dot(is_etf.tolist(), w), mf.Domain.lessThan(bands.etf_max))
-    if is_stock.sum() > 0:
-        M.constraint("stock_min", mf.Expr.dot(is_stock.tolist(), w), mf.Domain.greaterThan(bands.stock_min))
-        M.constraint("stock_max", mf.Expr.dot(is_stock.tolist(), w), mf.Domain.lessThan(bands.stock_max))
+    # ---- helper to build a model with selective constraints (for debug isolation) ----
+    def _solve_stage(
+        stage_name: str,
+        add_sleeves: bool,
+        add_te: bool,
+        add_sector_penalty: bool,
+    ):
+        M = mf.Model(stage_name)
+        if mosek_log:
+            import sys
+            M.setLogHandler(sys.stdout)
 
-    # --- Tracking error constraint ---
-    # || L (w - w_b) ||_2 <= te_cap, where Sigma = L L^T
-    ridge = 1e-10
-    Sigma2 = Sigma + ridge * np.eye(n)
+        w = M.variable("w", n, mf.Domain.inRange(0.0, ub.tolist()))
+        M.constraint("budget", mf.Expr.sum(w), mf.Domain.equalsTo(1.0))
 
-    try:
-        L = np.linalg.cholesky(Sigma2)
-    except np.linalg.LinAlgError:
-        vals, vecs = np.linalg.eigh(Sigma2)
-        vals = np.clip(vals, 0.0, None)
-        L = vecs @ np.diag(np.sqrt(vals))
+        if add_sleeves:
+            if is_etf.sum() > 0:
+                M.constraint("etf_min", mf.Expr.dot(is_etf.tolist(), w), mf.Domain.greaterThan(float(bands.etf_min)))
+                M.constraint("etf_max", mf.Expr.dot(is_etf.tolist(), w), mf.Domain.lessThan(float(bands.etf_max)))
+            if is_stock.sum() > 0:
+                M.constraint("stock_min", mf.Expr.dot(is_stock.tolist(), w), mf.Domain.greaterThan(float(bands.stock_min)))
+                M.constraint("stock_max", mf.Expr.dot(is_stock.tolist(), w), mf.Domain.lessThan(float(bands.stock_max)))
 
-    a = mf.Expr.sub(w, w_b.tolist())                     # active weights
-    y = mf.Expr.mul(mf.Matrix.dense(L), a)               # y = L a
-    M.constraint("te_cone", mf.Expr.vstack(float(te_cap), y), mf.Domain.inQCone())
+        if add_te:
+            # || L (w - w_b) || <= te_cap
+            ridge = 1e-10
+            Sigma2 = Sigma + ridge * np.eye(n)
+            Sigma2 = 0.5 * (Sigma2 + Sigma2.T)
 
-    # --- Soft sector deviation penalty ---
-    # z = S w - b_sec
-    # t >= ||z||^2   enforced via rotated QCone: [t, 1, z] in RQCone
-    # objective: max alpha^T w - gamma * t
-    z = mf.Expr.sub(mf.Expr.mul(mf.Matrix.dense(S), w), b_sec.tolist())
-    t = M.variable("sector_dev_sq", 1, mf.Domain.greaterThan(0.0))
-    M.constraint("sector_rqcone", mf.Expr.vstack(t, 1.0, z), mf.Domain.inRotatedQCone())
+            try:
+                L = np.linalg.cholesky(Sigma2)
+                _dbg("Cholesky OK (Sigma2 PSD).")
+            except np.linalg.LinAlgError:
+                _dbg("Cholesky failed; using eig sqrt.")
+                vals, vecs = np.linalg.eigh(Sigma2)
+                vals = np.clip(vals, 0.0, None)
+                L = vecs @ np.diag(np.sqrt(vals))
 
-    gamma = float(bands.sector_penalty_gamma)
-    obj = mf.Expr.sub(mf.Expr.dot(alpha.tolist(), w), mf.Expr.mul(gamma, t))
-    M.objective("obj", mf.ObjectiveSense.Maximize, obj)
+            a = mf.Expr.sub(w, w_b.tolist())
+            # IMPORTANT: use .tolist() for Fusion
+            y = mf.Expr.mul(mf.Matrix.dense(L.tolist()), a)
+            M.constraint("te_cone", mf.Expr.vstack(float(te_cap), y), mf.Domain.inQCone())
 
-    # Solve
-    try:
-        M.solve()
-        ps = str(M.getPrimalSolutionStatus()).lower()
-        if ps != "optimal":
+        if add_sector_penalty:
+            # Rotated cone: 2*t*1 >= ||z||^2  => t >= ||z||^2/2
+            z = mf.Expr.sub(mf.Expr.mul(mf.Matrix.dense(S.tolist()), w), b_sec.tolist())
+            tvar = M.variable("sector_dev_sq", 1, mf.Domain.greaterThan(0.0))
+            M.constraint("sector_rqcone", mf.Expr.vstack(tvar, 1.0, z), mf.Domain.inRotatedQCone())
+            gamma = float(bands.sector_penalty_gamma)
+            obj = mf.Expr.sub(mf.Expr.dot(alpha.tolist(), w), mf.Expr.mul(gamma, tvar))
+        else:
+            obj = mf.Expr.dot(alpha.tolist(), w)
+
+        M.objective("obj", mf.ObjectiveSense.Maximize, obj)
+
+        try:
+            M.solve()
+            ps = str(M.getPrimalSolutionStatus()).lower()
+            if "optimal" not in ps:
+                _dbg(f"{stage_name}: primal status={ps} (not optimal)")
+                M.dispose()
+                return None
+        except Exception as e:
+            _dbg(f"{stage_name}: solve exception: {e}")
             M.dispose()
             return None
-    except Exception:
+
+        w_opt = np.array(w.level(), dtype=float)
         M.dispose()
+        return w_opt
+
+    # ---- Debug staged feasibility isolation ----
+    if debug:
+        _dbg("Stage A: bounds+budget only (should ALWAYS be feasible if ub.sum>=1)")
+        wA = _solve_stage("stage_A", add_sleeves=False, add_te=False, add_sector_penalty=False)
+        if wA is None:
+            _dbg("❌ Infeasible at Stage A => UB/budget is broken (or Fusion domain issue).")
+            return None
+        _dbg(f"Stage A ok. sum={wA.sum():.6f}, min={wA.min():.6f}, max={wA.max():.6f}")
+
+        _dbg("Stage B: add sleeve constraints")
+        wB = _solve_stage("stage_B", add_sleeves=True, add_te=False, add_sector_penalty=False)
+        if wB is None:
+            _dbg("❌ Infeasible at Stage B => sleeve constraints contradict UB/budget.")
+            return None
+        _dbg(f"Stage B ok. ETF={float(is_etf@wB):.4f}, STOCK={float(is_stock@wB):.4f}")
+
+        _dbg("Stage C: add TE constraint (this is where your issue most likely is)")
+        wC = _solve_stage("stage_C", add_sleeves=True, add_te=True, add_sector_penalty=False)
+        if wC is None:
+            _dbg("❌ Infeasible at Stage C => TE constraint modeling or te_cap too tight.")
+            return None
+        activeC = wC - w_b
+        teC = float(np.sqrt(activeC @ Sigma @ activeC))
+        _dbg(f"Stage C ok. realized TE={teC:.6f} cap={te_cap}")
+
+        _dbg("Stage D: add sector penalty cone (should remain feasible)")
+        wD = _solve_stage("stage_D", add_sleeves=True, add_te=True, add_sector_penalty=True)
+        if wD is None:
+            _dbg("❌ Infeasible at Stage D => sector penalty cone modeling issue (unexpected).")
+            return None
+        _dbg("Stage D ok. Proceeding to final solve.")
+
+    # ---- Final solve (same as Stage D) ----
+    w_opt = _solve_stage("final", add_sleeves=True, add_te=True, add_sector_penalty=True)
+    if w_opt is None:
         return None
 
-    w_opt = np.array(w.level(), dtype=float)
-
-    # Post-metrics
     active = w_opt - w_b
     te = float(np.sqrt(active @ Sigma @ active))
     active_ret = float(alpha @ w_opt)
     ir = active_ret / te if te > 1e-12 else np.nan
 
-    # Sector deviation report
     sector_w = S @ w_opt
     sec_dev = sector_w - b_sec
-
-    M.dispose()
 
     return {
         "tickers": tickers,
@@ -325,6 +404,53 @@ def optimize_quadratic_portfolio(
     }
 
 
+def weights_to_target_shares(
+    *,
+    weights: dict[str, float],
+    portfolio_value: float,
+    latest_prices: pd.Series,
+    cash_ticker: str = "CASH",
+    price_floor: float = 1e-12,
+) -> dict[str, float]:
+    """
+    Convert portfolio weights -> target shares.
+
+    - For CASH: shares = dollars (since we treat cash as $1.00 per unit)
+    - For others: shares = (weight * portfolio_value) / price
+
+    Args:
+        weights: dict[ticker] = weight (sums to ~1)
+        portfolio_value: total portfolio dollars
+        latest_prices: pd.Series indexed by ticker (latest close)
+        cash_ticker: ticker used for cash in your snapshot
+        price_floor: guard against zero/near-zero prices
+
+    Returns:
+        dict[ticker] = target shares (float)
+    """
+    if portfolio_value <= 0:
+        raise ValueError("portfolio_value must be > 0")
+
+    tgt: dict[str, float] = {}
+    for t, w in weights.items():
+        w = float(w)
+        dollars = w * float(portfolio_value)
+
+        if t == cash_ticker:
+            # Treat cash as $1.00 per "share"
+            tgt[t] = dollars
+            continue
+
+        if t not in latest_prices.index or pd.isna(latest_prices[t]):
+            raise KeyError(f"Missing latest price for {t}. Ensure daily_prices has this ticker and is up to date.")
+
+        px = float(latest_prices[t])
+        if px <= price_floor:
+            raise ValueError(f"Non-positive price for {t}: {px}")
+
+        tgt[t] = dollars / px
+
+    return tgt
 
 # -----------------------------
 # Public API
@@ -458,77 +584,28 @@ def optimize_quadratic_portfolio(
 #     }
 
 
-def _plot_frontier(frontier: pd.DataFrame, path: Path) -> None:
-    df = frontier.dropna(subset=["te", "active_return", "ir"]).copy()
-    if df.empty:
-        return
+# def _plot_frontier(frontier: pd.DataFrame, path: Path) -> None:
+#     df = frontier.dropna(subset=["te", "active_return", "ir"]).copy()
+#     if df.empty:
+#         return
 
-    # 1) alpha vs TE
-    plt.figure()
-    plt.plot(df["te"], df["active_return"])
-    plt.xlabel("Tracking Error (annual)")
-    plt.ylabel("Expected Active Return (annual)")
-    plt.title("Active Frontier: Max Alpha subject to TE cap")
-    plt.tight_layout()
-    plt.savefig(path)
-    plt.close()
+#     # 1) alpha vs TE
+#     plt.figure()
+#     plt.plot(df["te"], df["active_return"])
+#     plt.xlabel("Tracking Error (annual)")
+#     plt.ylabel("Expected Active Return (annual)")
+#     plt.title("Active Frontier: Max Alpha subject to TE cap")
+#     plt.tight_layout()
+#     plt.savefig(path)
+#     plt.close()
 
-    # Optional second plot (IR vs TE) saved alongside
-    path2 = path.with_name(path.stem + "_ir.png")
-    plt.figure()
-    plt.plot(df["te"], df["ir"])
-    plt.xlabel("Tracking Error (annual)")
-    plt.ylabel("Information Ratio (alpha / TE)")
-    plt.title("Information Ratio vs Tracking Error")
-    plt.tight_layout()
-    plt.savefig(path2)
-    plt.close()
-
-
-def weights_to_target_shares(
-    *,
-    weights: dict[str, float],
-    portfolio_value: float,
-    latest_prices: pd.Series,
-    cash_ticker: str = "CASH",
-    price_floor: float = 1e-12,
-) -> dict[str, float]:
-    """
-    Convert portfolio weights -> target shares.
-
-    - For CASH: shares = dollars (since we treat cash as $1.00 per unit)
-    - For others: shares = (weight * portfolio_value) / price
-
-    Args:
-        weights: dict[ticker] = weight (sums to ~1)
-        portfolio_value: total portfolio dollars
-        latest_prices: pd.Series indexed by ticker (latest close)
-        cash_ticker: ticker used for cash in your snapshot
-        price_floor: guard against zero/near-zero prices
-
-    Returns:
-        dict[ticker] = target shares (float)
-    """
-    if portfolio_value <= 0:
-        raise ValueError("portfolio_value must be > 0")
-
-    tgt: dict[str, float] = {}
-    for t, w in weights.items():
-        w = float(w)
-        dollars = w * float(portfolio_value)
-
-        if t == cash_ticker:
-            # Treat cash as $1.00 per "share"
-            tgt[t] = dollars
-            continue
-
-        if t not in latest_prices.index or pd.isna(latest_prices[t]):
-            raise KeyError(f"Missing latest price for {t}. Ensure daily_prices has this ticker and is up to date.")
-
-        px = float(latest_prices[t])
-        if px <= price_floor:
-            raise ValueError(f"Non-positive price for {t}: {px}")
-
-        tgt[t] = dollars / px
-
-    return tgt
+#     # Optional second plot (IR vs TE) saved alongside
+#     path2 = path.with_name(path.stem + "_ir.png")
+#     plt.figure()
+#     plt.plot(df["te"], df["ir"])
+#     plt.xlabel("Tracking Error (annual)")
+#     plt.ylabel("Information Ratio (alpha / TE)")
+#     plt.title("Information Ratio vs Tracking Error")
+#     plt.tight_layout()
+#     plt.savefig(path2)
+#     plt.close()
