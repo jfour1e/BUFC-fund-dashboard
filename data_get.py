@@ -6,7 +6,7 @@ from polygon import RESTClient
 from datetime import datetime, timezone
 from typing import Iterable, Optional, Tuple
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_PRICE_CSV = ROOT_DIR / "daily_prices.csv"
 DEFAULT_RUT_CSV   = ROOT_DIR / "rut_daily.csv"
 
