@@ -5,18 +5,9 @@ import time
 import dash
 import os
 from dash import dcc, html
-from dash import dash_table
 import plotly.graph_objects as go
 import plotly.io as pio
 pio.templates.default = "plotly_white"
-
-from flask import Flask
-from dash import Dash
-
-server = Flask(__name__)  # this is correct
-app = Dash(__name__, server=server)
-
-application = app.server
 
 from polygon import RESTClient
 from dateutil.relativedelta import relativedelta
@@ -38,7 +29,7 @@ from dashboard_utils import (
 """
 Fetch Data 
 """
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 filepath = os.path.join(BASE_DIR, "BUFC_May_2025_Allocations.xlsx")
 
 holdings = load_clean_holdings(filepath)
@@ -73,7 +64,7 @@ live_portfolio['color'] = live_portfolio['pct_change'].apply(assign_color)
 # Cumulative returns (portfolio vs IWM)
 portfolio_cum, benchmark_cum = compute_cumulative_returns(live_portfolio, prices_data, rut_series)
 
-# data for sector donut 
+#create data for sector donut 
 sector_df = sector_allocations.copy()
 if 'Value' not in sector_df.columns and '% of Fund' in sector_df.columns:
     sector_df = sector_df.rename(columns={'% of Fund': 'Value'})
@@ -84,8 +75,9 @@ if 'Sector' in sector_df.columns:
 
 
 """
- Dash app 
+Create Dash app 
 """
+app = dash.Dash(__name__)
 app.title = "BUFC Fund Dashboard"
 
 app.layout = html.Div([
@@ -99,14 +91,7 @@ app.layout = html.Div([
             ),
 
             html.Div(
-                dash_table.DataTable(
-                    columns=[{"name": i, "id": i} for i in live_portfolio.columns],
-                    data=live_portfolio.to_dict('records'),
-                    style_table={'overflowX': 'auto'},
-                    style_cell={'textAlign': 'left', 'padding': '5px'},
-                    style_header={'fontWeight': 'bold'},
-                    page_size=20  # optional, allows pagination
-                ),
+                create_holdings_table(live_portfolio, prices_data),
                 style={'padding': '20px'}
             )
         ]),
@@ -153,4 +138,4 @@ app.layout = html.Div([
 ])
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False, dev_tools_hot_reload=False)
+    app.run(host='127.0.0.1', port=8050, debug=True, use_reloader=False, dev_tools_hot_reload=False)
