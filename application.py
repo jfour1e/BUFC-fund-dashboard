@@ -29,19 +29,25 @@ from dashboard_utils import (
 """
 Fetch Data 
 """
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 filepath = os.path.join(BASE_DIR, "BUFC_May_2025_Allocations.xlsx")
 
-holdings = load_clean_holdings(filepath)
-sector_allocations = load_clean_sector_allocations(filepath)
+def load_data():
+    holdings = load_clean_holdings(filepath)
+    sector_allocations = load_clean_sector_allocations(filepath)
 
-API_KEY = "apRxKKpQoM2_K8sPhJ5a0IFvs7C0tGs1" 
-client = RESTClient(API_KEY)
+    API_KEY = "apRxKKpQoM2_K8sPhJ5a0IFvs7C0tGs1" 
+    client = RESTClient(API_KEY)
+    
+    prices_data = fetch_price_data(companies, client)
+    rut_series = fetch_RUT_data(client)
 
-prices_data = fetch_price_data(companies, client)
-rut_series = fetch_RUT_data(client)
+    print("___________ Fetched Data ___________")
 
-print("___________ Fetched Data ___________")
+    return holdings, sector_allocations, prices_data, rut_series
+
+holdings, sector_allocations, prices_data, rut_series = load_data()
 
 """
 Build portfolio Snapshot
