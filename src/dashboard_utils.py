@@ -5,21 +5,34 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import math
+from dateutil.relativedelta import relativedelta
 
-def compute_daily_pct_change(prices_df):
+def compute_daily_pct_change(prices_df, cash_ticker="CASH"):
     """
-    Compute the percent change between the last two trading days for each ticker.
-    Return a dict: {ticker: percent_change}.
+    Compute percent change between last two available (non-NaN) prices per ticker.
+    CASH is forced to 0.0.
     """
     pct_change = {}
+
     for ticker in prices_df.columns:
-        if len(prices_df[ticker]) >= 2:
-            today_price = prices_df[ticker].iloc[-1]
-            prev_price  = prices_df[ticker].iloc[-2]
-            pct_change[ticker] = (today_price - prev_price) / prev_price * 100
+        if ticker == cash_ticker:
+            pct_change[ticker] = 0.0
+            continue
+
+        s = prices_df[ticker].dropna()
+        if len(s) >= 2 and s.iloc[-2] != 0:
+            pct_change[ticker] = (s.iloc[-1] - s.iloc[-2]) / s.iloc[-2] * 100.0
         else:
             pct_change[ticker] = 0.0
+
+    # enforce again even if CASH wasn't in columns
+    pct_change[cash_ticker] = 0.0
     return pct_change
+
+
+def log_step(msg: str) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
 
 def assign_color(pct):
     """
@@ -145,28 +158,25 @@ def create_treemap(portfolio_df) -> go.Figure:
 
 
 def create_sparkline(prices_series: pd.Series) -> go.Figure:
-    """
-    Create a small Plotly line chart (“sparkline”) for a given price series.
-    Axes are hidden, margins are minimized, and height is small (20px).
-    """
+    s = prices_series.sort_index().ffill().dropna()
 
     fig = go.Figure(data=[
         go.Scatter(
-            x         = prices_series.index,
-            y         = prices_series.values,
-            mode      = 'lines',
+            x=s.index,
+            y=s.values,
+            mode='lines',
             line=dict(color='blue'),
-            hoverinfo = 'none'
+            hoverinfo='none'
         )
     ])
 
     fig.update_layout(
-        autosize=False, 
-        height=24,   
-        width=120,    
-        xaxis    = dict(visible=False),
-        yaxis    = dict(visible=False),
-        margin   = dict(l=0, r=0, t=2, b=2),
+        autosize=False,
+        height=24,
+        width=120,
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        margin=dict(l=0, r=0, t=2, b=2),
         showlegend=False
     )
     return fig
@@ -180,113 +190,131 @@ def create_holdings_table(portfolio_df: pd.DataFrame, prices_df: pd.DataFrame) -
       - Shares Owned
       - Current Value
       - Cost Basis
-      - Return (e.g. P/L or pct, if you want to show that)
-      - Price History (YTD sparkline)
+      - Return
+      - Price History (Trailing 3M sparkline)
 
-    Alternates row background for readability.
+    Adds a TOTAL row at bottom (total value + return since inception).
+    CASH has no sparkline.
     """
-    # 1) Header Row (no "Company" column, since portfolio_df doesn’t have it)
     header = html.Tr([
-        html.Th('Ticker',                  style={'padding': '8px', 'text-align': 'left'}),
-        html.Th('% of Portfolio',          style={'padding': '8px', 'text-align': 'right'}),
-        html.Th('Shares Owned',            style={'padding': '8px', 'text-align': 'right'}),
-        html.Th('Current Value',           style={'padding': '8px', 'text-align': 'right'}),
-        html.Th('Cost Basis',              style={'padding': '8px', 'text-align': 'right'}),
-        html.Th('Return',                  style={'padding': '8px', 'text-align': 'right'}),
-        html.Th('Price History (YTD)',      style={'padding': '8px', 'text-align': 'center'}),
+        html.Th('Ticker',             style={'padding': '8px', 'text-align': 'left'}),
+        html.Th('% of Portfolio',     style={'padding': '8px', 'text-align': 'right'}),
+        html.Th('Shares Owned',       style={'padding': '8px', 'text-align': 'right'}),
+        html.Th('Current Value',      style={'padding': '8px', 'text-align': 'right'}),
+        html.Th('Cost Basis',         style={'padding': '8px', 'text-align': 'right'}),
+        html.Th('Return',             style={'padding': '8px', 'text-align': 'right'}),
+        html.Th('Price History (3M)', style={'padding': '8px', 'text-align': 'center'}),
     ], style={'backgroundColor': '#CCCCCC'})
-        
-    # 2) Determine “start of current period” for 3M filtering
-    start_of_year = pd.Timestamp(datetime.today().year, 1, 1)
 
-    # 3) Build each row
+    end_dt = prices_df.index.max() if len(prices_df.index) else pd.Timestamp.today()
+    start_of_period = end_dt - relativedelta(months=3)
+
     rows = []
     for idx, row in portfolio_df.iterrows():
         ticker     = row['Ticker']
-        weight_pct = row['weights']
-        shares     = row['shares']
-        curr_val   = row['current value']
-        cost_basis = row['cost basis']
-        ret_val    = row.get('return', None)  # Use .get in case "return" is missing
+        weight_pct = float(row['weights']) if pd.notna(row['weights']) else 0.0
+        shares     = float(row['shares']) if pd.notna(row['shares']) else 0.0
+        curr_val   = float(row['current value']) if pd.notna(row['current value']) else float("nan")
+        cost_basis = float(row['cost basis']) if pd.notna(row['cost basis']) else float("nan")
+        ret_val    = row.get('return', None)
 
-        shares_display = math.ceil(shares - 1e-6) 
+        shares_display = math.ceil(shares - 1e-6)
 
-        # Extract price series for sparkline
-        if ticker in prices_df.columns:
-            prices_series = prices_df[ticker][prices_df.index >= start_of_year]
+        # Sparkline cell (blank for CASH)
+        if ticker == "CASH":
+            sparkline_cell = html.Td("", style={'padding': '2px', 'width': '120px', 'height': '24px'})
         else:
-            prices_series = pd.Series(dtype=float)
+            if ticker in prices_df.columns:
+                prices_series = prices_df.loc[prices_df.index >= start_of_period, ticker]
+            else:
+                prices_series = pd.Series(dtype=float)
 
-        # Create the sparkline figure (you must have defined create_sparkline elsewhere)
-        sparkline_fig = create_sparkline(prices_series)
+            sparkline_fig = create_sparkline(prices_series)
+            sparkline_cell = html.Td(
+                dcc.Graph(
+                    figure=sparkline_fig,
+                    config={'displayModeBar': False, 'staticPlot': True, 'responsive': False}
+                ),
+                style={'padding': '2px', 'width': '120px', 'height': '24px'}
+            )
 
-        # Alternate row color shading
         bg_color = '#F9F9F9' if (idx % 2 == 0) else 'white'
 
-        # Create the <tr> for this row
         rows.append(
             html.Tr([
-                html.Td(ticker,                                    style={'padding': '8px'}),
-                html.Td(f"{weight_pct:.2%}",                       style={'padding': '8px', 'text-align': 'right'}),
-                html.Td(f"{shares_display:,.2f}",         
-                    style={'padding': '8px', 'text-align': 'right'}), 
-                html.Td(f"${curr_val:,.2f}",                       style={'padding': '8px', 'text-align': 'right'}),
-                html.Td(f"${cost_basis:,.2f}",                     style={'padding': '8px', 'text-align': 'right'}),
-                html.Td(f"{ret_val:.2%}" if ret_val is not None else "—",
+                html.Td(ticker, style={'padding': '8px'}),
+                html.Td(f"{weight_pct:.2%}", style={'padding': '8px', 'text-align': 'right'}),
+                html.Td(f"{shares_display:,.2f}", style={'padding': '8px', 'text-align': 'right'}),
+                html.Td(f"${curr_val:,.2f}" if pd.notna(curr_val) else "—",
                         style={'padding': '8px', 'text-align': 'right'}),
-                html.Td(
-                    dcc.Graph(figure=sparkline_fig, config={'displayModeBar': False, 'staticPlot': True, 'responsive': False}),
-                    style={'padding': '2px', 'width': '120px', 'height': '24px'}
-                )
+                html.Td(f"${cost_basis:,.2f}" if pd.notna(cost_basis) else "—",
+                        style={'padding': '8px', 'text-align': 'right'}),
+                html.Td(f"{ret_val:.2%}" if (ret_val is not None and pd.notna(ret_val)) else "—",
+                        style={'padding': '8px', 'text-align': 'right'}),
+                sparkline_cell
             ], style={'backgroundColor': bg_color})
         )
 
-    # Assemble the entire <table>
-    table = html.Table(
-        [header] + rows,
-        style={'width': '100%', 'border-collapse': 'collapse'}
+    # TOTAL row
+    total_value = portfolio_df["current value"].sum(skipna=True)
+    total_cost  = portfolio_df["cost basis"].sum(skipna=True)
+    total_ret   = (total_value - total_cost) / total_cost if (total_cost and total_cost > 0) else None
+
+    rows.append(
+        html.Tr([
+            html.Td("TOTAL", style={'padding': '8px', 'font-weight': 'bold'}),
+            html.Td("100.00%", style={'padding': '8px', 'text-align': 'right', 'font-weight': 'bold'}),
+            html.Td("—", style={'padding': '8px', 'text-align': 'right', 'font-weight': 'bold'}),
+            html.Td(f"${total_value:,.2f}", style={'padding': '8px', 'text-align': 'right', 'font-weight': 'bold'}),
+            html.Td(f"${total_cost:,.2f}", style={'padding': '8px', 'text-align': 'right', 'font-weight': 'bold'}),
+            html.Td(f"{total_ret:.2%}" if total_ret is not None else "—",
+                    style={'padding': '8px', 'text-align': 'right', 'font-weight': 'bold'}),
+            html.Td("", style={'padding': '2px', 'width': '120px', 'height': '24px'})
+        ], style={'backgroundColor': '#EEEEEE'})
     )
-    return table
+
+    return html.Table([header] + rows, style={'width': '100%', 'border-collapse': 'collapse'})
 
 
-def compute_cumulative_returns(
-    portfolio_df: pd.DataFrame,
-    prices_df: pd.DataFrame,
-    benchmark_series: pd.Series
-):
-    """
-    Compute two time series:
-      (a) portfolio_cum: the portfolio’s cumulative return over time
-      (b) benchmark_cum: the benchmark’s cumulative return over time (e.g. Russell 2000)
-    Steps:
-      1. Multiply each ticker’s daily price by number of shares → daily position values
-      2. Sum across tickers → daily portfolio total value
-      3. Compute daily % returns, then take (1 + returns).cumprod()
-      4. Do the same for benchmark_series
-    Returns:
-      portfolio_cum, benchmark_cum  (both pandas.Series indexed by date)
-    """
-    # (1) Build a “shares” series aligned to prices_df’s columns
-    shares_series = portfolio_df.set_index('Ticker')['shares']
-    # Filter for tickers actually present in prices_df
-    common_tickers = [t for t in shares_series.index if t in prices_df.columns]
+def compute_cumulative_returns(portfolio_df: pd.DataFrame, prices_df: pd.DataFrame, benchmark_series: pd.Series):
+    # shares keyed by ticker
+    shares = portfolio_df.set_index("Ticker")["shares"]
 
-    # (2) Compute daily portfolio values:
-    #     prices_df[common_tickers] is (dates × tickers). Multiply columnwise by shares_series.
-    daily_values = prices_df[common_tickers].multiply(
-        shares_series[common_tickers], axis=1
-    ).sum(axis=1)
+    common = [t for t in shares.index if t in prices_df.columns]
+    if not common:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
 
-    # (3) Daily returns and cumulative product
-    port_returns = daily_values.pct_change().fillna(0)
+    # Use forward-filled prices, so gaps don't turn portfolio value into 0
+    px = prices_df[common].sort_index().ffill()
+
+    # IMPORTANT: min_count=1 prevents all-NaN rows from becoming 0.0
+    daily_values = px.multiply(shares[common], axis=1).sum(axis=1, min_count=1)
+
+    # Drop leading NaNs (before any valid prices exist)
+    daily_values = daily_values.dropna()
+    if daily_values.empty:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+
+    port_returns = daily_values.pct_change().fillna(0.0)
     portfolio_cum = (1 + port_returns).cumprod()
 
-    # (4) Benchmark returns & cumulative product
-    bench_returns = benchmark_series.pct_change().fillna(0)
+    bench = benchmark_series.sort_index().ffill().reindex(portfolio_cum.index).ffill()
+    bench_returns = bench.pct_change().fillna(0.0)
     benchmark_cum = (1 + bench_returns).cumprod()
 
     return portfolio_cum, benchmark_cum
 
+
+def sector_df_from_live_portfolio(live_portfolio: pd.DataFrame, holdings_info: dict) -> pd.DataFrame:
+    """
+    Build sector allocation dataframe from live_portfolio weights using HOLDINGS_INFO.
+    Returns columns: Sector, Value (Value is weight fraction).
+    """
+    df = live_portfolio.copy()
+    df["Sector"] = df["Ticker"].map(lambda t: holdings_info.get(t, {}).get("sector", "Unknown"))
+    out = df.groupby("Sector", as_index=False)["weights"].sum()
+    out = out.rename(columns={"weights": "Value"})
+    return out.sort_values("Value", ascending=False).reset_index(drop=True)
 
 def create_sector_donut(df: pd.DataFrame) -> go.Figure:
     """

@@ -1,77 +1,96 @@
+import os
 import pandas as pd
 import numpy as np
-from datetime import timedelta, datetime
-import time
+from datetime import datetime
+
 import dash
-import os
 from dash import dcc, html
 import plotly.graph_objects as go
 import plotly.io as pio
 pio.templates.default = "plotly_white"
 
 from polygon import RESTClient
-from dateutil.relativedelta import relativedelta
+from API_KEY import POLYGON_API_KEY
+from companies import HOLDINGS_INFO, RUSSELL_SECTOR_WEIGHTS
 
-from companies import companies, sector_designations
-from data_get import (
-    load_clean_holdings, load_clean_sector_allocations,
-    fetch_price_data, build_live_portfolio, 
-    fetch_RUT_data
+from portfolio_data_manager import (
+    read_wide_csv,
+    ensure_prices,
+    build_live_portfolio_dashboard,
 )
 from dashboard_utils import (
-    compute_daily_pct_change, assign_color, 
-    create_treemap, create_sparkline, 
-    create_holdings_table, compute_cumulative_returns, 
-    create_sector_donut
+    compute_daily_pct_change, assign_color,
+    create_treemap, create_sparkline,
+    create_holdings_table, compute_cumulative_returns,
+    create_sector_donut,
+    sector_df_from_live_portfolio, log_step
 )
-from API_KEY import POLYGON_API_KEY
 
 """
-Fetch Data 
+Fetch Data
 """
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-filepath = os.path.join(BASE_DIR, "BUFC_May_2025_Allocations.xlsx")
+DATA_DIR = os.path.join(BASE_DIR, "data")
 
-holdings = load_clean_holdings(filepath)
-sector_allocations = load_clean_sector_allocations(filepath)
+PORTFOLIO_SNAPSHOT_CSV = os.path.join(DATA_DIR, "portfolio_snapshot.csv")
+DAILY_PRICES_CSV      = os.path.join(DATA_DIR, "daily_prices.csv")
+COST_BASIS_CSV        = os.path.join(DATA_DIR, "cost_basis_snapshot.csv")
 
 client = RESTClient(POLYGON_API_KEY)
 
-prices_data = fetch_price_data(companies, client)
-rut_series = fetch_RUT_data(client)
+# Load snapshot (wide shares)
+log_step(f"Reading snapshot: {PORTFOLIO_SNAPSHOT_CSV}")
+snapshot = read_wide_csv(PORTFOLIO_SNAPSHOT_CSV)
+log_step(f"Snapshot dates: {snapshot.index.min().date()} -> {snapshot.index.max().date()} | cols={len(snapshot.columns)}")
 
-print("___________ Fetched Data ___________")
+if snapshot.empty:
+    raise ValueError("portfolio_snapshot.csv is empty/missing.")
+
 
 """
 Build portfolio Snapshot
 """
-live_portfolio = build_live_portfolio(holdings, prices_data)
+tickers_needed = sorted((set(snapshot.columns) | set(HOLDINGS_INFO.keys()) | {"IWM"}) - {"CASH"})
 
-latest_prices = prices_data.ffill().iloc[-1]
-mask = live_portfolio['Ticker'].isin(latest_prices.index)
+log_step(f"Tickers needed (incl IWM): {len(tickers_needed)}")
 
-live_portfolio.loc[mask, 'current value'] = (
-    live_portfolio.loc[mask, 'shares'] * live_portfolio.loc[mask, 'Ticker'].map(latest_prices)
+# Ensure price history exists / up-to-date (business days)
+ensure_prices(
+    client=client,
+    daily_prices_csv=DAILY_PRICES_CSV,
+    tickers=tickers_needed,
+    start_date="2025-01-02",
+    freq="B",
 )
-live_portfolio['weights'] = live_portfolio['current value'] / live_portfolio['current value'].sum()
+log_step("Prices ensured")
 
-#percent change map
+prices_data = read_wide_csv(DAILY_PRICES_CSV)
+log_step(f"Prices range: {prices_data.index.min().date()} -> {prices_data.index.max().date()} | cols={len(prices_data.columns)}")
+
+# Build live_portfolio in exact schema required by dashboard
+live_portfolio = build_live_portfolio_dashboard(
+    portfolio_snapshot_csv=PORTFOLIO_SNAPSHOT_CSV,
+    daily_prices_csv=DAILY_PRICES_CSV,
+    cost_basis_csv=COST_BASIS_CSV,
+    cash_ticker="CASH",
+)
+log_step(f"Live portfolio rows: {len(live_portfolio)} | total weight={live_portfolio['weights'].sum():.4f}")
+
+# Percent changes + colors
 pct_change_map = compute_daily_pct_change(prices_data)
-live_portfolio['pct_change'] = live_portfolio['Ticker'].map(pct_change_map)
-live_portfolio['color'] = live_portfolio['pct_change'].apply(assign_color)
+live_portfolio["pct_change"] = live_portfolio["Ticker"].map(pct_change_map).fillna(0.0)
+live_portfolio["color"] = live_portfolio["pct_change"].apply(assign_color)
+
+# Benchmark series (IWM)
+rut_series = prices_data["IWM"].ffill() if "IWM" in prices_data.columns else pd.Series(dtype=float)
 
 # Cumulative returns (portfolio vs IWM)
 portfolio_cum, benchmark_cum = compute_cumulative_returns(live_portfolio, prices_data, rut_series)
 
-#create data for sector donut 
-sector_df = sector_allocations.copy()
-if 'Value' not in sector_df.columns and '% of Fund' in sector_df.columns:
-    sector_df = sector_df.rename(columns={'% of Fund': 'Value'})
+# Sector donut data: compute from live_portfolio + HOLDINGS_INFO
+sector_df = sector_df_from_live_portfolio(live_portfolio, HOLDINGS_INFO)
 
-# Drop any total row if present 
-if 'Sector' in sector_df.columns:
-    sector_df = sector_df[sector_df['Sector'].str.lower() != 'total']
-
+print("___________ Fetched Data ___________")
 
 """
 Create Dash app 
