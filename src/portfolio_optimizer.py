@@ -452,160 +452,109 @@ def weights_to_target_shares(
 
     return tgt
 
-# -----------------------------
-# Public API
-# -----------------------------
-# def run_te_sweep_and_select_best_ir(
-#     *,
-#     daily_prices_csv: str | Path,
-#     holdings_info: Dict[str, dict],
-#     russell_sector_weights: Dict[str, float],
-#     investable_universe: Optional[List[str]] = None,
-#     bands: OptimizerBands = OptimizerBands(),
-#     run_cfg: OptimizerRunConfig = OptimizerRunConfig(),
-#     cash_ticker: str = "CASH",
-#     save_plot: bool = True,
-# ) -> Dict:
-#     """
-#     Returns:
-#       {
-#         "best": {...},
-#         "frontier": DataFrame(te_cap, te, active_return, ir),
-#         "tickers": [...],
-#         "plot_path": Path | None
-#       }
-#     """
-#     root = project_root()
+def plot_frontier_in_notebook(frontier: pd.DataFrame) -> None:
+    df = frontier.replace([np.inf, -np.inf], np.nan).dropna(subset=["te", "active_return", "ir"]).copy()
+    if df.empty:
+        print("No feasible points to plot.")
+        return
 
-#     prices = read_prices_wide(daily_prices_csv)
+    # Active return vs TE
+    plt.figure()
+    plt.plot(df["te"], df["active_return"], marker="o", linestyle="-")
+    plt.xlabel("Tracking Error (annual)")
+    plt.ylabel("Expected Active Return (annual)")
+    plt.title("Active Frontier: objective vs TE cap")
+    plt.tight_layout()
+    plt.show()
 
-#     # Determine tickers for optimization:
-#     # - use investable_universe if provided, else HOLDINGS_INFO keys
-#     base = set(investable_universe) if investable_universe else set(holdings_info.keys())
-#     base.discard("CASH")  # cash handled explicitly
+    # IR vs TE
+    plt.figure()
+    plt.plot(df["te"], df["ir"], marker="o", linestyle="-")
+    plt.xlabel("Tracking Error (annual)")
+    plt.ylabel("Information Ratio (active_return / TE)")
+    plt.title("Information Ratio vs Tracking Error")
+    plt.tight_layout()
+    plt.show()
 
-#     # --- Determine tickers for optimization: ONLY HOLDINGS_INFO keys (+ CASH) ---
-#     universe = sorted(set(holdings_info.keys()))
-#     if cash_ticker not in universe:
-#         universe.append(cash_ticker)
+def run_te_sweep_frontier(
+    *,
+    daily_prices_csv: str | Path,
+    holdings_info: dict[str, dict[str, Any]],
+    russell_sector_weights: dict[str, float],
+    bands,
+    te_min: float = 0.00,
+    te_max: float = 0.12,
+    te_points: int = 50,
+    lookback_days: int = 252,
+    debug: bool = False,
+    mosek_log: bool = False,
+    plot: bool = True,
+) -> dict[str, Any]:
+    """
+    Notebook-friendly TE sweep that repeatedly calls optimize_quadratic_portfolio(...).
 
-#     # We need prices for all non-cash assets
-#     prices = read_prices_wide(daily_prices_csv).sort_index()
-#     prices = prices.ffill()
+    Returns:
+      {
+        "best": dict | None,
+        "frontier": DataFrame(te_cap, te, active_return, ir, status),
+        "solutions": list[dict|None] aligned to te grid,
+        "te_grid": np.ndarray,
+        "best_index": int | None,
+      }
+    """
+    te_grid = np.linspace(float(te_min), float(te_max), int(te_points))
 
-#     missing_cols = [t for t in universe if t != cash_ticker and t not in prices.columns]
-#     if missing_cols:
-#         raise ValueError(
-#             f"daily_prices is missing columns for these HOLDINGS_INFO tickers: {missing_cols}\n"
-#             "Fix: ensure_prices(...) for these tickers, or remove them from HOLDINGS_INFO."
-#         )
+    rows: list[dict[str, Any]] = []
+    solutions: list[dict[str, Any] | None] = []
 
-#     tickers = universe
+    for te_cap in te_grid:
+        res = optimize_quadratic_portfolio(
+            daily_prices_csv=daily_prices_csv,
+            holdings_info=holdings_info,
+            russell_sector_weights=russell_sector_weights,
+            te_cap=float(te_cap),
+            bands=bands,
+            lookback_days=int(lookback_days),
+            debug=bool(debug),
+            mosek_log=bool(mosek_log),
+        )
 
-#     # Build returns matrix for covariance
-#     # Use lookback window ending at latest available
-#     prices_sub = prices[[t for t in tickers if t != cash_ticker]].copy()
+        if res is None:
+            rows.append({
+                "te_cap": float(te_cap),
+                "te": np.nan,
+                "active_return": np.nan,
+                "ir": np.nan,
+                "status": "infeasible_or_failed",
+            })
+            solutions.append(None)
+        else:
+            rows.append({
+                "te_cap": float(te_cap),
+                "te": float(res.get("te", np.nan)),
+                "active_return": float(res.get("active_return", np.nan)),
+                "ir": float(res.get("ir", np.nan)),
+                "status": "ok",
+            })
+            solutions.append(res)
 
-#     if run_cfg.drop_if_all_nan:
-#         prices_sub = prices_sub.dropna(axis=1, how="all")
+    frontier = pd.DataFrame(rows)
 
-#     end_dt = prices_sub.index.max()
-#     start_dt = end_dt - pd.Timedelta(days=int(run_cfg.lookback_days * 1.5))
-#     prices_sub = prices_sub.loc[prices_sub.index >= start_dt].copy()
+    # pick best by IR
+    frontier_ok = frontier.replace([np.inf, -np.inf], np.nan).dropna(subset=["ir"]).copy()
+    best = None
+    best_index = None
+    if not frontier_ok.empty:
+        best_index = int(frontier_ok["ir"].idxmax())
+        best = solutions[best_index]
 
-#     returns = compute_daily_returns(prices_sub).dropna(how="all")
+    if plot:
+        plot_frontier_in_notebook(frontier)
 
-#     # Align columns to tickers (excluding CASH)
-#     risk_tickers = list(prices_sub.columns)
-
-#     # LW covariance on risk assets
-#     Sigma_risk = ledoit_wolf_cov(returns[risk_tickers], annualization=run_cfg.annualization)
-
-#     # Expand Sigma to include CASH with zero variance/cov
-#     n = len(tickers)
-#     Sigma = np.zeros((n, n), dtype=float)
-#     idx_map = {t: i for i, t in enumerate(tickers)}
-#     for i, ti in enumerate(risk_tickers):
-#         for j, tj in enumerate(risk_tickers):
-#             Sigma[idx_map[ti], idx_map[tj]] = Sigma_risk[i, j]
-#     # CASH row/col stays 0
-
-#     # alpha + benchmark vector
-#     alpha, w_b, _, _ = compute_alpha_vector(
-#         tickers=tickers,
-#         holdings_info=holdings_info,
-#         russell_sector_weights=russell_sector_weights,
-#         cash_ticker=cash_ticker,
-#     )
-
-#     # TE grid
-#     te_caps = np.linspace(run_cfg.te_min, run_cfg.te_max, run_cfg.te_points)
-
-#     rows = []
-#     solutions = []
-
-#     for te_cap in te_caps:
-#         sol = solve_max_alpha_under_te(
-#             tickers=tickers,
-#             alpha=alpha,
-#             Sigma=Sigma,
-#             w_b=w_b,
-#             holdings_info=holdings_info,
-#             russell_sector_weights=russell_sector_weights,
-#             sector_band=bands.sector_band,
-#             te_cap=float(te_cap),
-#             bands=bands,
-#             cash_ticker=cash_ticker,
-#         )
-#         if sol is None:
-#             rows.append({"te_cap": te_cap, "te": np.nan, "active_return": np.nan, "ir": np.nan})
-#             solutions.append(None)
-#             continue
-
-#         rows.append({"te_cap": te_cap, "te": sol["te"], "active_return": sol["active_return"], "ir": sol["ir"]})
-#         solutions.append(sol)
-
-#     frontier = pd.DataFrame(rows)
-
-#     # choose best IR among feasible solutions
-#     best_idx = frontier["ir"].replace([np.inf, -np.inf], np.nan).idxmax()
-#     best = solutions[int(best_idx)] if pd.notna(best_idx) else None
-
-#     plot_path = None
-#     if save_plot:
-#         plot_path = root / "optimizer_frontier.png"
-#         _plot_frontier(frontier, plot_path)
-
-#     return {
-#         "best": best,
-#         "frontier": frontier,
-#         "tickers": tickers,
-#         "plot_path": plot_path,
-#     }
-
-
-# def _plot_frontier(frontier: pd.DataFrame, path: Path) -> None:
-#     df = frontier.dropna(subset=["te", "active_return", "ir"]).copy()
-#     if df.empty:
-#         return
-
-#     # 1) alpha vs TE
-#     plt.figure()
-#     plt.plot(df["te"], df["active_return"])
-#     plt.xlabel("Tracking Error (annual)")
-#     plt.ylabel("Expected Active Return (annual)")
-#     plt.title("Active Frontier: Max Alpha subject to TE cap")
-#     plt.tight_layout()
-#     plt.savefig(path)
-#     plt.close()
-
-#     # Optional second plot (IR vs TE) saved alongside
-#     path2 = path.with_name(path.stem + "_ir.png")
-#     plt.figure()
-#     plt.plot(df["te"], df["ir"])
-#     plt.xlabel("Tracking Error (annual)")
-#     plt.ylabel("Information Ratio (alpha / TE)")
-#     plt.title("Information Ratio vs Tracking Error")
-#     plt.tight_layout()
-#     plt.savefig(path2)
-#     plt.close()
+    return {
+        "best": best,
+        "frontier": frontier,
+        "solutions": solutions,
+        "te_grid": te_grid,
+        "best_index": best_index,
+    }
